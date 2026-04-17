@@ -1,19 +1,16 @@
 [package]
 name = "oxideav-codec"
-# Tracked independently of the workspace version since this crate's
-# trait surface evolves slower than the per-codec implementations.
 version = "0.0.4"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-description = "Codec traits and registry for oxideav"
-
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Codec (Decoder + Encoder) traits and registry for oxideav — pure Rust, no C deps"
+repository = "https://github.com/OxideAV/oxideav-codec"
+homepage = "https://github.com/OxideAV/oxideav-codec"
 readme = "README.md"
-homepage.workspace = true
 keywords = ["multimedia", "codec", "decoder", "encoder", "pure-rust"]
 categories = ["multimedia::encoding"]
 
 [dependencies]
-oxideav-core = { workspace = true }
+oxideav-core = "0.0"
