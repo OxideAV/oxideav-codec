@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, CodecPreferences, CodecTag, Error, Result,
+    CodecCapabilities, CodecId, CodecParameters, CodecPreferences, CodecResolver, CodecTag, Error,
+    Result,
 };
 
 use crate::{Decoder, DecoderFactory, Encoder, EncoderFactory};
@@ -332,6 +333,18 @@ impl CodecRegistry {
         self.tag_claims
             .iter()
             .flat_map(|(tag, claims)| claims.iter().map(move |(id, c)| (tag, id, c)))
+    }
+}
+
+/// Implement the shared [`CodecResolver`] interface so container
+/// demuxers can accept `&dyn CodecResolver` without depending on
+/// this crate directly — the trait lives in oxideav-core.
+impl CodecResolver for CodecRegistry {
+    fn resolve_tag(&self, tag: &CodecTag, probe_data: Option<&[u8]>) -> Option<CodecId> {
+        // Delegate to the inherent method and clone the result so the
+        // trait returns an owned CodecId (the inherent method returns
+        // &CodecId tied to the registry's lifetime).
+        CodecRegistry::resolve_tag(self, tag, probe_data).cloned()
     }
 }
 
