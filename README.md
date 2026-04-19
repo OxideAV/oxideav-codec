@@ -8,13 +8,20 @@ implements `Decoder` and/or `Encoder` and registers itself via a
 the union of every enabled feature.
 
 * **`Decoder`** — `send_packet` → `receive_frame`, plus `flush` (EOS
-  drain) and `reset` (state wipe after seek, added in 0.0.4).
+  drain) and `reset` (state wipe after seek).
 * **`Encoder`** — `send_frame` → `receive_packet`, plus `flush`.
 * **`CodecCapabilities`** — per-impl flags (lossless, intra-only,
   accepted pixel formats, supported sample rates, priority) so
   registries can pick the right implementation for a given request.
 * **`CodecRegistry`** — factory lookup by `CodecId`, with fallback when
-  the first-choice implementation refuses the input.
+  the first-choice implementation refuses the input. Also implements
+  `oxideav_core::CodecResolver`, so containers can delegate
+  tag-to-codec resolution (AVI FourCC, WAVEFORMATEX `wFormatTag`, MP4
+  OTI, Matroska CodecID) to the registry without a direct dep on this
+  crate.
+* **`claim_tag`** — codecs attach one or more `CodecTag`s to their id
+  at registration time, with priority + an optional probe function for
+  the tag-collision cases (e.g. `DIV3` that's actually MPEG-4 Part 2).
 
 Zero C dependencies. Zero FFI.
 
@@ -22,7 +29,7 @@ Zero C dependencies. Zero FFI.
 
 ```toml
 [dependencies]
-oxideav-codec = "0.0"
+oxideav-codec = "0.1"
 ```
 
 ## Using a codec directly (standalone, no container, no pipeline)
@@ -37,8 +44,8 @@ Example — decoding G.711 µ-law:
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-g711 = "0.0"
 ```
 
@@ -154,6 +161,33 @@ pub fn register(reg: &mut oxideav_codec::CodecRegistry) {
     );
 }
 ```
+
+## Claiming container tags
+
+A codec can attach container-level tags to its id so demuxers resolve
+them automatically. Tag kinds live in `oxideav_core::CodecTag` — AVI
+FourCC, WAVEFORMATEX `wFormatTag`, MP4 `ObjectTypeIndication`, and
+Matroska CodecID strings. Priority breaks ties; an optional probe
+disambiguates genuine collisions (the `DIV3`-tagged-as-MPEG-4-Part-2
+case that breaks naive FourCC tables):
+
+```rust
+use oxideav_core::{CodecId, CodecTag};
+
+let cid = CodecId::new("mpeg4video");
+
+// Unambiguous claims: just a priority.
+reg.claim_tag(cid.clone(), CodecTag::fourcc(b"XVID"), 10, None);
+reg.claim_tag(cid.clone(), CodecTag::fourcc(b"DX50"), 10, None);
+
+// Ambiguous: DIV3 is usually msmpeg4v3 but sometimes real Part 2.
+// Claim it at a lower priority with a probe — the demuxer decides
+// per-packet by peeking at the bitstream.
+reg.claim_tag(cid, CodecTag::fourcc(b"DIV3"), 5, Some(probe_is_mpeg4_part2));
+```
+
+Demuxers resolve via `registry.resolve_tag(&tag, probe_data)` — which is
+what `oxideav-avi`, `oxideav-mp4`, and `oxideav-mkv` do internally.
 
 ## License
 
