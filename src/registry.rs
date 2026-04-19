@@ -1,38 +1,120 @@
-//! In-process codec registry — supports multiple implementations per codec
-//! id, ranked by capability + priority + user preferences with init-time
-//! fallback.
+//! In-process codec registry.
+//!
+//! Every codec crate declares itself with one [`CodecInfo`] value —
+//! capabilities, factory functions, the container tags it claims, and
+//! (optionally) a probe function used to disambiguate genuine tag
+//! collisions. The registry stores those registrations and exposes
+//! three orthogonal lookups:
+//!
+//! - **id-keyed** — `make_decoder(params)` / `make_encoder(params)` walk
+//!   the implementations registered under `params.codec_id`, filter by
+//!   capability restrictions, and try them in priority order with init-
+//!   time fallback.
+//! - **tag-keyed** — `resolve_tag(&ProbeContext)` walks every
+//!   registration whose `tags` contains `ctx.tag`, calls each probe
+//!   (treating `None` as "returns 1.0"), and returns the id with the
+//!   highest resulting confidence. First-registered wins on ties.
+//! - **diagnostic** — `all_implementations`, `all_tag_registrations`.
+//!
+//! The tag path explicitly DOES NOT short-circuit on "first claim with
+//! no probe" — every claimant is asked, so a lower-priority probed
+//! claim can out-rank a higher-priority unprobed one when the content
+//! is actually ambiguous (DIV3 XVID-with-real-MSMPEG4 payload etc.).
 
 use std::collections::HashMap;
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecParameters, CodecPreferences, CodecResolver, CodecTag, Error,
-    Result,
+    ProbeContext, ProbeFn, Result,
 };
 
 use crate::{Decoder, DecoderFactory, Encoder, EncoderFactory};
 
-/// A bitstream-probe function that inspects the first bytes of a packet
-/// and returns true if this codec can decode it. Lets the registry
-/// disambiguate the many container tags that get mislabelled in the
-/// wild (most famous: AVI FourCC `DIV3` routing to MPEG-4 Part 2
-/// instead of MS-MPEG4v3).
-pub type CodecProbe = fn(&[u8]) -> bool;
-
-/// One codec's claim on a container tag. Stored inside the registry;
-/// callers don't usually construct this directly, see
-/// [`CodecRegistry::claim_tag`].
-#[derive(Clone, Copy)]
-pub struct TagClaim {
-    /// Higher = preferred when multiple codecs claim the same tag.
-    pub priority: u8,
-    /// Optional bitstream probe. Returns true to accept this claim,
-    /// false to skip and try the next one in priority order.
-    pub probe: Option<CodecProbe>,
+/// A single registration: capabilities, decoder/encoder factories,
+/// optional probe, and the container tags this codec claims.
+///
+/// Codec crates build one of these per codec id inside their
+/// `register(reg)` function and hand it to
+/// [`CodecRegistry::register`]. The struct is `#[non_exhaustive]` so
+/// additional fields can be added without breaking existing codec
+/// crates — construction is only possible through
+/// [`CodecInfo::new`] plus the builder methods below.
+#[non_exhaustive]
+pub struct CodecInfo {
+    pub id: CodecId,
+    pub capabilities: CodecCapabilities,
+    pub decoder_factory: Option<DecoderFactory>,
+    pub encoder_factory: Option<EncoderFactory>,
+    /// Probe function that returns a confidence in `0.0..=1.0` for a
+    /// given [`ProbeContext`]. `None` means "confidence 1.0 for every
+    /// claimed tag" — the correct default for codecs whose tag claims
+    /// are unambiguous.
+    pub probe: Option<ProbeFn>,
+    /// Tags this codec is willing to be looked up under. One codec may
+    /// claim many tags (an AAC decoder covers several WaveFormat ids,
+    /// a FourCC, an MP4 OTI, and a Matroska CodecID string at once).
+    pub tags: Vec<CodecTag>,
 }
 
-/// One registered implementation: capability description + factories.
-/// Either / both factories may be present depending on whether the impl
-/// can decode, encode, or both.
+impl CodecInfo {
+    /// Start a new registration for `id` with empty capabilities, no
+    /// factories, no probe, and no tags. Chain the builder methods
+    /// below to fill it in, then hand the result to
+    /// [`CodecRegistry::register`].
+    pub fn new(id: CodecId) -> Self {
+        Self {
+            capabilities: CodecCapabilities::audio(id.as_str()),
+            id,
+            decoder_factory: None,
+            encoder_factory: None,
+            probe: None,
+            tags: Vec::new(),
+        }
+    }
+
+    /// Replace the capability description. The default built by
+    /// [`Self::new`] is a placeholder (audio-flavoured, no flags); every
+    /// real registration should call this.
+    pub fn capabilities(mut self, caps: CodecCapabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
+    pub fn decoder(mut self, factory: DecoderFactory) -> Self {
+        self.decoder_factory = Some(factory);
+        self
+    }
+
+    pub fn encoder(mut self, factory: EncoderFactory) -> Self {
+        self.encoder_factory = Some(factory);
+        self
+    }
+
+    pub fn probe(mut self, probe: ProbeFn) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Claim a single container tag for this codec. Equivalent to
+    /// `.tags([tag])` but avoids the array ceremony for single-tag
+    /// claims.
+    pub fn tag(mut self, tag: CodecTag) -> Self {
+        self.tags.push(tag);
+        self
+    }
+
+    /// Claim a set of container tags for this codec. Takes any
+    /// iterable (arrays, `Vec`, `Option`, …) so the common case of a
+    /// codec with 3-6 tags reads as one clean block.
+    pub fn tags(mut self, tags: impl IntoIterator<Item = CodecTag>) -> Self {
+        self.tags.extend(tags);
+        self
+    }
+}
+
+/// Internal per-impl record held inside the registry's id map. Kept
+/// distinct from [`CodecInfo`] so the id map stays cheap to walk
+/// during `make_decoder` / `make_encoder` lookups.
 #[derive(Clone)]
 pub struct CodecImplementation {
     pub caps: CodecCapabilities,
@@ -42,13 +124,24 @@ pub struct CodecImplementation {
 
 #[derive(Default)]
 pub struct CodecRegistry {
+    /// id → list of implementations. Each registered codec appends one
+    /// entry here. `make_decoder` / `make_encoder` walk this list in
+    /// preference order.
     impls: HashMap<CodecId, Vec<CodecImplementation>>,
-    /// Tag-to-codec-id map. Containers call [`Self::resolve_tag`] to
-    /// turn their in-stream codec tag (FourCC / WAVEFORMATEX /
-    /// Matroska id / …) into a [`CodecId`] without hard-coding the
-    /// mapping themselves. Claims are kept sorted by priority
-    /// descending so resolution is cheap.
-    tag_claims: HashMap<CodecTag, Vec<(CodecId, TagClaim)>>,
+    /// Append-only list of every registration — the `tag_index` stores
+    /// offsets into this vector.
+    registrations: Vec<RegistrationRecord>,
+    /// Tag → indices into `registrations`. Indices are stored in
+    /// registration order so tie-breaking in `resolve_tag` is
+    /// deterministic (first-registered wins).
+    tag_index: HashMap<CodecTag, Vec<usize>>,
+}
+
+/// Internal registry record. Mirrors the subset of [`CodecInfo`]
+/// needed at resolve time.
+struct RegistrationRecord {
+    id: CodecId,
+    probe: Option<ProbeFn>,
 }
 
 impl CodecRegistry {
@@ -56,79 +149,59 @@ impl CodecRegistry {
         Self::default()
     }
 
-    /// Register a codec implementation. The same codec id may be registered
-    /// multiple times — for example a software FLAC decoder and (later) a
-    /// hardware one would both register under id `"flac"`.
-    pub fn register(&mut self, id: CodecId, implementation: CodecImplementation) {
-        self.impls.entry(id).or_default().push(implementation);
-    }
-
-    /// Convenience: register a decoder-only implementation built from a
-    /// caps + factory pair.
-    pub fn register_decoder_impl(
-        &mut self,
-        id: CodecId,
-        caps: CodecCapabilities,
-        factory: DecoderFactory,
-    ) {
-        self.register(
+    /// Register one codec. Expands into:
+    ///   * an entry in the id → implementations map (for
+    ///     `make_decoder` / `make_encoder`);
+    ///   * an entry in the tag index for every claimed tag (for
+    ///     `resolve_tag`).
+    ///
+    /// Calling `register` multiple times with the same id is allowed
+    /// and how multi-implementation codecs (software-plus-hardware
+    /// FLAC, for example) are expressed.
+    pub fn register(&mut self, info: CodecInfo) {
+        let CodecInfo {
             id,
-            CodecImplementation {
-                caps: caps.with_decode(),
-                make_decoder: Some(factory),
-                make_encoder: None,
-            },
-        );
-    }
+            capabilities,
+            decoder_factory,
+            encoder_factory,
+            probe,
+            tags,
+        } = info;
 
-    /// Convenience: register an encoder-only implementation.
-    pub fn register_encoder_impl(
-        &mut self,
-        id: CodecId,
-        caps: CodecCapabilities,
-        factory: EncoderFactory,
-    ) {
-        self.register(
-            id,
-            CodecImplementation {
-                caps: caps.with_encode(),
-                make_decoder: None,
-                make_encoder: Some(factory),
-            },
-        );
-    }
+        let caps = {
+            let mut c = capabilities;
+            if decoder_factory.is_some() {
+                c = c.with_decode();
+            }
+            if encoder_factory.is_some() {
+                c = c.with_encode();
+            }
+            c
+        };
 
-    /// Convenience: register a single implementation that handles both
-    /// decode and encode for a codec id.
-    pub fn register_both(
-        &mut self,
-        id: CodecId,
-        caps: CodecCapabilities,
-        decode: DecoderFactory,
-        encode: EncoderFactory,
-    ) {
-        self.register(
-            id,
-            CodecImplementation {
-                caps: caps.with_decode().with_encode(),
-                make_decoder: Some(decode),
-                make_encoder: Some(encode),
-            },
-        );
-    }
+        // Only record an implementation entry when at least one factory
+        // is present. A "tag-only" CodecInfo — used to attach extra tag
+        // claims to a codec that was already registered with factories —
+        // shouldn't pollute the impl list.
+        if decoder_factory.is_some() || encoder_factory.is_some() {
+            self.impls
+                .entry(id.clone())
+                .or_default()
+                .push(CodecImplementation {
+                    caps,
+                    make_decoder: decoder_factory,
+                    make_encoder: encoder_factory,
+                });
+        }
 
-    /// Backwards-compat shim: register a decoder-only impl with default
-    /// software capabilities. Prefer `register_decoder_impl` for new code.
-    pub fn register_decoder(&mut self, id: CodecId, factory: DecoderFactory) {
-        let caps = CodecCapabilities::audio(id.as_str()).with_decode();
-        self.register_decoder_impl(id, caps, factory);
-    }
-
-    /// Backwards-compat shim: register an encoder-only impl with default
-    /// software capabilities.
-    pub fn register_encoder(&mut self, id: CodecId, factory: EncoderFactory) {
-        let caps = CodecCapabilities::audio(id.as_str()).with_encode();
-        self.register_encoder_impl(id, caps, factory);
+        let record_idx = self.registrations.len();
+        self.registrations.push(RegistrationRecord {
+            id: id.clone(),
+            probe,
+        });
+        for tag in tags {
+            self.tag_index.entry(tag).or_default().push(record_idx);
+        }
     }
 
     pub fn has_decoder(&self, id: &CodecId) -> bool {
@@ -248,91 +321,43 @@ impl CodecRegistry {
             .flat_map(|(id, v)| v.iter().map(move |i| (id, i)))
     }
 
-    /// Attach a codec id to a container tag so demuxers can look up
-    /// the right decoder without each container maintaining its own
-    /// hand-written FourCC / WAVEFORMATEX / Matroska table.
-    ///
-    /// A single tag may be claimed by multiple codecs — the typical
-    /// reason is mislabelling in the wild: e.g. AVI FourCC `DIV3`
-    /// legally means MS-MPEG4v3 but in practice is applied to real
-    /// MPEG-4 Part 2 streams often enough that both `oxideav-msmpeg4`
-    /// and `oxideav-mpeg4video` want to claim it, each with a probe
-    /// that accepts the bitstream it actually understands.
-    ///
-    /// Claims are stored sorted by `priority` descending;
-    /// [`Self::resolve_tag`] walks them in order and returns the
-    /// first whose probe accepts (or the first with no probe).
-    pub fn claim_tag(
-        &mut self,
-        id: CodecId,
-        tag: CodecTag,
-        priority: u8,
-        probe: Option<CodecProbe>,
-    ) {
-        let entry = self.tag_claims.entry(tag).or_default();
-        entry.push((id, TagClaim { priority, probe }));
-        // Stable sort — later registrations with equal priority appear
-        // after earlier ones, which matches "probe-backed claims come
-        // first, catch-all fallbacks last" when priorities are equal.
-        entry.sort_by_key(|(_, claim)| std::cmp::Reverse(claim.priority));
+    /// Iterator over every `(tag, codec_id)` pair currently registered —
+    /// used by `oxideav tags` debug output and by tests that want to
+    /// walk the tag surface.
+    pub fn all_tag_registrations(&self) -> impl Iterator<Item = (&CodecTag, &CodecId)> {
+        self.tag_index.iter().flat_map(move |(tag, idxs)| {
+            idxs.iter().map(move |&i| (tag, &self.registrations[i].id))
+        })
     }
 
-    /// Resolve a container tag to a codec id. Walks the priority-
-    /// ordered claim list and returns the first matching one:
+    /// Inherent form of tag resolution that returns a reference.
+    /// The owned-value form used by container code lives behind the
+    /// [`CodecResolver`] trait impl below.
     ///
-    /// * Claim has a probe + `probe_data` is `Some(d)` → accept iff
-    ///   `probe(d)` returns true; otherwise skip and try the next.
-    /// * Claim has a probe + `probe_data` is `None` → accept
-    ///   (probing without bytes is impossible; fall back to priority).
-    /// * Claim has no probe → accept (catch-all).
-    ///
-    /// Returns `None` if the tag has no claimants.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use oxideav_codec::CodecRegistry;
-    /// use oxideav_core::{CodecId, CodecTag};
-    ///
-    /// let mut reg = CodecRegistry::new();
-    /// reg.claim_tag(CodecId::new("flac"), CodecTag::fourcc(b"FLAC"), 10, None);
-    ///
-    /// let resolved = reg.resolve_tag(&CodecTag::fourcc(b"FLAC"), None);
-    /// assert_eq!(resolved.map(|c| c.as_str()), Some("flac"));
-    /// ```
-    pub fn resolve_tag(&self, tag: &CodecTag, probe_data: Option<&[u8]>) -> Option<&CodecId> {
-        let claims = self.tag_claims.get(tag)?;
-        for (id, claim) in claims {
-            match (claim.probe, probe_data) {
-                (None, _) => return Some(id),
-                (Some(_), None) => return Some(id),
-                (Some(p), Some(d)) => {
-                    if p(d) {
-                        return Some(id);
-                    }
-                }
+    /// Walks every registration that claimed `ctx.tag`, calls its
+    /// probe with `ctx`, and returns the id of the registration that
+    /// scored highest. Probes that return `0.0` are discarded; ties
+    /// on confidence are broken by registration order (first wins).
+    /// Registrations with no probe are treated as returning `1.0`.
+    pub fn resolve_tag_ref(&self, ctx: &ProbeContext) -> Option<&CodecId> {
+        let idxs = self.tag_index.get(ctx.tag)?;
+        let mut best: Option<(f32, usize)> = None;
+        for &i in idxs {
+            let rec = &self.registrations[i];
+            let conf = match rec.probe {
+                Some(f) => f(ctx),
+                None => 1.0,
+            };
+            if conf <= 0.0 {
+                continue;
             }
+            best = match best {
+                None => Some((conf, i)),
+                Some((bc, _)) if conf > bc => Some((conf, i)),
+                other => other,
+            };
         }
-        None
-    }
-
-    /// Return the full list of claims for a tag in priority order —
-    /// useful for diagnostics (`oxideav tags` / error messages when
-    /// no claim accepts the probed bytes).
-    pub fn claims_for_tag(&self, tag: &CodecTag) -> &[(CodecId, TagClaim)] {
-        self.tag_claims
-            .get(tag)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Iterator over every tag claim currently registered — used by
-    /// `oxideav tags` debug output and by integration tests that want
-    /// to verify the full tag surface.
-    pub fn all_tag_claims(&self) -> impl Iterator<Item = (&CodecTag, &CodecId, &TagClaim)> {
-        self.tag_claims
-            .iter()
-            .flat_map(|(tag, claims)| claims.iter().map(move |(id, c)| (tag, id, c)))
+        best.map(|(_, i)| &self.registrations[i].id)
     }
 }
 
@@ -340,11 +365,8 @@ impl CodecRegistry {
 /// demuxers can accept `&dyn CodecResolver` without depending on
 /// this crate directly — the trait lives in oxideav-core.
 impl CodecResolver for CodecRegistry {
-    fn resolve_tag(&self, tag: &CodecTag, probe_data: Option<&[u8]>) -> Option<CodecId> {
-        // Delegate to the inherent method and clone the result so the
-        // trait returns an owned CodecId (the inherent method returns
-        // &CodecId tied to the registry's lifetime).
-        CodecRegistry::resolve_tag(self, tag, probe_data).cloned()
+    fn resolve_tag(&self, ctx: &ProbeContext) -> Option<CodecId> {
+        self.resolve_tag_ref(ctx).cloned()
     }
 }
 
@@ -386,21 +408,37 @@ mod tag_tests {
     use super::*;
     use oxideav_core::CodecCapabilities;
 
-    fn looks_like_msmpeg4(data: &[u8]) -> bool {
-        // For tests: MS-MPEG4 if no 0x000001 start code in first 8 bytes.
-        !data.windows(3).take(6).any(|w| w == [0x00, 0x00, 0x01])
+    /// Probe: return 1.0 iff the peeked bytes look like MS-MPEG4 (no
+    /// 0x000001 start code in the first few bytes).
+    fn probe_msmpeg4(ctx: &ProbeContext) -> f32 {
+        match ctx.packet {
+            Some(d) if !d.windows(3).take(6).any(|w| w == [0x00, 0x00, 0x01]) => 1.0,
+            Some(_) => 0.0,
+            None => 0.5, // no data yet — weak evidence
+        }
     }
 
-    fn looks_like_mpeg4_part2(data: &[u8]) -> bool {
-        data.windows(3).take(6).any(|w| w == [0x00, 0x00, 0x01])
+    /// Probe: return 1.0 iff the peeked bytes look like MPEG-4 Part 2
+    /// (starts with a 0x000001 start code in the first few bytes).
+    fn probe_mpeg4_part2(ctx: &ProbeContext) -> f32 {
+        match ctx.packet {
+            Some(d) if d.windows(3).take(6).any(|w| w == [0x00, 0x00, 0x01]) => 1.0,
+            Some(_) => 0.0,
+            None => 0.5,
+        }
+    }
+
+    fn info(id: &str) -> CodecInfo {
+        CodecInfo::new(CodecId::new(id)).capabilities(CodecCapabilities::audio(id))
     }
 
     #[test]
     fn resolve_single_claim_no_probe() {
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(CodecId::new("flac"), CodecTag::fourcc(b"FLAC"), 10, None);
+        reg.register(info("flac").tag(CodecTag::fourcc(b"FLAC")));
+        let t = CodecTag::fourcc(b"FLAC");
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"FLAC"), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&t))
                 .map(|c| c.as_str()),
             Some("flac"),
         );
@@ -409,146 +447,122 @@ mod tag_tests {
     #[test]
     fn resolve_missing_tag_returns_none() {
         let reg = CodecRegistry::new();
-        assert!(reg.resolve_tag(&CodecTag::fourcc(b"????"), None).is_none());
+        let t = CodecTag::fourcc(b"????");
+        assert!(reg.resolve_tag_ref(&ProbeContext::new(&t)).is_none());
     }
 
     #[test]
-    fn priority_highest_wins() {
+    fn unprobed_claims_tie_first_registered_wins() {
+        // Two unprobed claims on the same tag: deterministic order.
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(CodecId::new("low"), CodecTag::fourcc(b"TEST"), 1, None);
-        reg.claim_tag(CodecId::new("high"), CodecTag::fourcc(b"TEST"), 10, None);
-        reg.claim_tag(CodecId::new("mid"), CodecTag::fourcc(b"TEST"), 5, None);
+        reg.register(info("first").tag(CodecTag::fourcc(b"TEST")));
+        reg.register(info("second").tag(CodecTag::fourcc(b"TEST")));
+        let t = CodecTag::fourcc(b"TEST");
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"TEST"), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&t))
                 .map(|c| c.as_str()),
-            Some("high"),
+            Some("first"),
         );
     }
 
     #[test]
-    fn probe_chooses_matching_bitstream() {
-        // DIV3: msmpeg4v3 claims with "looks like MS" probe, mpeg4video
-        // claims with "looks like Part 2" probe. A packet beginning with
-        // 0x000001B0 (MPEG-4 Part 2 VOS) must route to mpeg4video even
-        // though msmpeg4v3 has the higher priority.
+    fn probe_picks_matching_bitstream() {
+        // The core bug fix: every probe is asked and the highest
+        // confidence wins regardless of registration order.
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(
-            CodecId::new("msmpeg4v3"),
-            CodecTag::fourcc(b"DIV3"),
-            10,
-            Some(looks_like_msmpeg4),
+        reg.register(
+            info("msmpeg4v3")
+                .probe(probe_msmpeg4)
+                .tag(CodecTag::fourcc(b"DIV3")),
         );
-        reg.claim_tag(
-            CodecId::new("mpeg4video"),
-            CodecTag::fourcc(b"DIV3"),
-            5,
-            Some(looks_like_mpeg4_part2),
+        reg.register(
+            info("mpeg4video")
+                .probe(probe_mpeg4_part2)
+                .tag(CodecTag::fourcc(b"DIV3")),
         );
 
         let mpeg4_part2 = [0x00u8, 0x00, 0x01, 0xB0, 0x01, 0x00];
         let ms_mpeg4 = [0x85u8, 0x3F, 0xD4, 0x80, 0x00, 0xA2];
+        let tag = CodecTag::fourcc(b"DIV3");
 
+        let ctx_part2 = ProbeContext::new(&tag).packet(&mpeg4_part2);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"DIV3"), Some(&mpeg4_part2))
-                .map(|c| c.as_str()),
+            reg.resolve_tag_ref(&ctx_part2).map(|c| c.as_str()),
             Some("mpeg4video"),
         );
+        let ctx_ms = ProbeContext::new(&tag).packet(&ms_mpeg4);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"DIV3"), Some(&ms_mpeg4))
-                .map(|c| c.as_str()),
+            reg.resolve_tag_ref(&ctx_ms).map(|c| c.as_str()),
             Some("msmpeg4v3"),
         );
     }
 
     #[test]
-    fn probed_claims_without_probe_data_fall_back_to_priority() {
+    fn unprobed_claim_wins_against_low_confidence_probe() {
+        // One codec claims a tag without a probe (→ confidence 1.0)
+        // and another claims it with a probe returning 0.3. The
+        // unprobed one wins — a codec that knows it owns the tag
+        // outright should not lose to a speculative probe.
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(
-            CodecId::new("msmpeg4v3"),
-            CodecTag::fourcc(b"DIV3"),
-            10,
-            Some(looks_like_msmpeg4),
+        reg.register(info("owner").tag(CodecTag::fourcc(b"OWN_")));
+        reg.register(
+            info("speculative")
+                .probe(|_| 0.3)
+                .tag(CodecTag::fourcc(b"OWN_")),
         );
-        reg.claim_tag(
-            CodecId::new("mpeg4video"),
-            CodecTag::fourcc(b"DIV3"),
-            5,
-            Some(looks_like_mpeg4_part2),
-        );
-        // No probe_data → highest-priority wins.
+        let t = CodecTag::fourcc(b"OWN_");
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"DIV3"), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&t))
                 .map(|c| c.as_str()),
-            Some("msmpeg4v3"),
+            Some("owner"),
         );
     }
 
     #[test]
-    fn fallback_no_probe_catches_everything() {
+    fn probe_returning_zero_is_skipped() {
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(
-            CodecId::new("picky"),
-            CodecTag::fourcc(b"MAYB"),
-            10,
-            Some(|_| false), // never accepts
+        reg.register(
+            info("refuses")
+                .probe(|_| 0.0)
+                .tag(CodecTag::fourcc(b"MAYB")),
         );
-        reg.claim_tag(CodecId::new("fallback"), CodecTag::fourcc(b"MAYB"), 1, None);
+        reg.register(info("fallback").tag(CodecTag::fourcc(b"MAYB")));
+        let t = CodecTag::fourcc(b"MAYB");
+        let ctx = ProbeContext::new(&t).packet(b"hello");
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"MAYB"), Some(b"hello"))
-                .map(|c| c.as_str()),
+            reg.resolve_tag_ref(&ctx).map(|c| c.as_str()),
             Some("fallback"),
-        );
-    }
-
-    #[test]
-    fn claims_for_tag_returns_ordered_list() {
-        let mut reg = CodecRegistry::new();
-        reg.claim_tag(CodecId::new("a"), CodecTag::fourcc(b"XYZ1"), 1, None);
-        reg.claim_tag(CodecId::new("b"), CodecTag::fourcc(b"XYZ1"), 9, None);
-        reg.claim_tag(CodecId::new("c"), CodecTag::fourcc(b"XYZ1"), 5, None);
-        let claims: Vec<_> = reg
-            .claims_for_tag(&CodecTag::fourcc(b"XYZ1"))
-            .iter()
-            .map(|(id, c)| (id.as_str().to_string(), c.priority))
-            .collect();
-        assert_eq!(
-            claims,
-            vec![
-                ("b".to_string(), 9),
-                ("c".to_string(), 5),
-                ("a".to_string(), 1),
-            ],
         );
     }
 
     #[test]
     fn fourcc_case_insensitive_lookup() {
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(CodecId::new("vid"), CodecTag::fourcc(b"div3"), 10, None);
-        // Registered as "DIV3" (uppercase via ctor); lookup using lowercase
-        // also hits thanks to fourcc()-normalisation on lookup side.
-        assert!(reg.resolve_tag(&CodecTag::fourcc(b"DIV3"), None).is_some());
-        assert!(reg.resolve_tag(&CodecTag::fourcc(b"div3"), None).is_some());
-        assert!(reg.resolve_tag(&CodecTag::fourcc(b"DiV3"), None).is_some());
+        reg.register(info("vid").tag(CodecTag::fourcc(b"div3")));
+        // Registered as "DIV3" (uppercase via ctor); lookup using
+        // lowercase / mixed case also hits.
+        let upper = CodecTag::fourcc(b"DIV3");
+        let lower = CodecTag::fourcc(b"div3");
+        let mixed = CodecTag::fourcc(b"DiV3");
+        assert!(reg.resolve_tag_ref(&ProbeContext::new(&upper)).is_some());
+        assert!(reg.resolve_tag_ref(&ProbeContext::new(&lower)).is_some());
+        assert!(reg.resolve_tag_ref(&ProbeContext::new(&mixed)).is_some());
     }
 
     #[test]
     fn wave_format_and_matroska_tags_work() {
         let mut reg = CodecRegistry::new();
-        reg.claim_tag(CodecId::new("mp3"), CodecTag::wave_format(0x0055), 10, None);
-        reg.claim_tag(
-            CodecId::new("h264"),
-            CodecTag::matroska("V_MPEG4/ISO/AVC"),
-            10,
-            None,
-        );
+        reg.register(info("mp3").tag(CodecTag::wave_format(0x0055)));
+        reg.register(info("h264").tag(CodecTag::matroska("V_MPEG4/ISO/AVC")));
+        let wf = CodecTag::wave_format(0x0055);
+        let mk = CodecTag::matroska("V_MPEG4/ISO/AVC");
         assert_eq!(
-            reg.resolve_tag(&CodecTag::wave_format(0x0055), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&wf))
                 .map(|c| c.as_str()),
             Some("mp3"),
         );
         assert_eq!(
-            reg.resolve_tag(&CodecTag::matroska("V_MPEG4/ISO/AVC"), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&mk))
                 .map(|c| c.as_str()),
             Some("h264"),
         );
@@ -557,22 +571,36 @@ mod tag_tests {
     #[test]
     fn mp4_object_type_tag_works() {
         let mut reg = CodecRegistry::new();
-        // 0x40 = MPEG-4 AAC per ISO/IEC 14496-1.
-        reg.claim_tag(
-            CodecId::new("aac"),
-            CodecTag::mp4_object_type(0x40),
-            10,
-            None,
-        );
+        reg.register(info("aac").tag(CodecTag::mp4_object_type(0x40)));
+        let t = CodecTag::mp4_object_type(0x40);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::mp4_object_type(0x40), None)
+            reg.resolve_tag_ref(&ProbeContext::new(&t))
                 .map(|c| c.as_str()),
             Some("aac"),
         );
     }
 
     #[test]
-    fn suppress_unused_caps() {
-        let _ = CodecCapabilities::audio("dummy");
+    fn multi_tag_claim_all_resolve() {
+        let mut reg = CodecRegistry::new();
+        reg.register(info("aac").tags([
+            CodecTag::fourcc(b"MP4A"),
+            CodecTag::wave_format(0x00FF),
+            CodecTag::mp4_object_type(0x40),
+            CodecTag::matroska("A_AAC"),
+        ]));
+        for t in [
+            CodecTag::fourcc(b"MP4A"),
+            CodecTag::wave_format(0x00FF),
+            CodecTag::mp4_object_type(0x40),
+            CodecTag::matroska("A_AAC"),
+        ] {
+            assert_eq!(
+                reg.resolve_tag_ref(&ProbeContext::new(&t))
+                    .map(|c| c.as_str()),
+                Some("aac"),
+                "tag {t:?} did not resolve",
+            );
+        }
     }
 }
