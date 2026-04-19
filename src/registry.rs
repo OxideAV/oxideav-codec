@@ -24,8 +24,8 @@
 use std::collections::HashMap;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, CodecPreferences, CodecResolver, CodecTag, Error,
-    ProbeContext, ProbeFn, Result,
+    CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecPreferences,
+    CodecResolver, CodecTag, Error, OptionField, ProbeContext, ProbeFn, Result,
 };
 
 use crate::{Decoder, DecoderFactory, Encoder, EncoderFactory};
@@ -54,6 +54,13 @@ pub struct CodecInfo {
     /// claim many tags (an AAC decoder covers several WaveFormat ids,
     /// a FourCC, an MP4 OTI, and a Matroska CodecID string at once).
     pub tags: Vec<CodecTag>,
+    /// Schema of the encoder's recognised option keys
+    /// (`CodecParameters::options`). Attached with
+    /// [`Self::encoder_options`]. Used for validation / `oxideav list`
+    /// / pipeline JSON checks.
+    pub encoder_options_schema: Option<&'static [OptionField]>,
+    /// Schema of the decoder's recognised option keys.
+    pub decoder_options_schema: Option<&'static [OptionField]>,
 }
 
 impl CodecInfo {
@@ -69,6 +76,8 @@ impl CodecInfo {
             encoder_factory: None,
             probe: None,
             tags: Vec::new(),
+            encoder_options_schema: None,
+            decoder_options_schema: None,
         }
     }
 
@@ -110,6 +119,24 @@ impl CodecInfo {
         self.tags.extend(tags);
         self
     }
+
+    /// Declare the options struct this codec's encoder factory expects.
+    /// Attaches `T::SCHEMA` so the registry can enumerate recognised
+    /// option keys (for `oxideav list`, pipeline JSON validation, etc.).
+    /// The factory itself still has to call
+    /// [`oxideav_core::parse_options::<T>()`] against
+    /// `CodecParameters::options` at init time.
+    pub fn encoder_options<T: CodecOptionsStruct>(mut self) -> Self {
+        self.encoder_options_schema = Some(T::SCHEMA);
+        self
+    }
+
+    /// Declare the options struct this codec's decoder factory expects.
+    /// See [`Self::encoder_options`] for the encoder counterpart.
+    pub fn decoder_options<T: CodecOptionsStruct>(mut self) -> Self {
+        self.decoder_options_schema = Some(T::SCHEMA);
+        self
+    }
 }
 
 /// Internal per-impl record held inside the registry's id map. Kept
@@ -120,6 +147,13 @@ pub struct CodecImplementation {
     pub caps: CodecCapabilities,
     pub make_decoder: Option<DecoderFactory>,
     pub make_encoder: Option<EncoderFactory>,
+    /// Encoder options schema declared via
+    /// [`CodecInfo::encoder_options`]. `None` means the encoder accepts
+    /// no tuning knobs (any non-empty `CodecParameters::options` will
+    /// still be rejected by the factory if the encoder calls
+    /// `parse_options` — this is purely informational for discovery).
+    pub encoder_options_schema: Option<&'static [OptionField]>,
+    pub decoder_options_schema: Option<&'static [OptionField]>,
 }
 
 #[derive(Default)]
@@ -166,6 +200,8 @@ impl CodecRegistry {
             encoder_factory,
             probe,
             tags,
+            encoder_options_schema,
+            decoder_options_schema,
         } = info;
 
         let caps = {
@@ -191,6 +227,8 @@ impl CodecRegistry {
                     caps,
                     make_decoder: decoder_factory,
                     make_encoder: encoder_factory,
+                    encoder_options_schema,
+                    decoder_options_schema,
                 });
         }
 
@@ -311,6 +349,26 @@ impl CodecRegistry {
     /// All registered implementations of a given codec id.
     pub fn implementations(&self, id: &CodecId) -> &[CodecImplementation] {
         self.impls.get(id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Lookup the encoder options schema for a registered codec. Walks
+    /// implementations in registration order and returns the first
+    /// schema found. `None` means either the codec isn't registered or
+    /// no implementation declared an encoder schema.
+    pub fn encoder_options_schema(&self, id: &CodecId) -> Option<&'static [OptionField]> {
+        self.impls
+            .get(id)?
+            .iter()
+            .find_map(|i| i.encoder_options_schema)
+    }
+
+    /// Lookup the decoder options schema — see
+    /// [`encoder_options_schema`](Self::encoder_options_schema).
+    pub fn decoder_options_schema(&self, id: &CodecId) -> Option<&'static [OptionField]> {
+        self.impls
+            .get(id)?
+            .iter()
+            .find_map(|i| i.decoder_options_schema)
     }
 
     /// Iterator over every (codec_id, impl) pair — useful for `oxideav list`
