@@ -19,9 +19,11 @@ the union of every enabled feature.
   tag-to-codec resolution (AVI FourCC, WAVEFORMATEX `wFormatTag`, MP4
   OTI, Matroska CodecID) to the registry without a direct dep on this
   crate.
-* **`claim_tag`** — codecs attach one or more `CodecTag`s to their id
-  at registration time, with priority + an optional probe function for
-  the tag-collision cases (e.g. `DIV3` that's actually MPEG-4 Part 2).
+* **Tag claims** — a codec attaches one or more `CodecTag`s to its id
+  via `CodecInfo::tag(...)` / `.tags([...])`, optionally with a probe
+  function that returns an `f32` confidence in `0.0..=1.0` for the
+  tag-collision cases (e.g. `DIV3` that's actually MPEG-4 Part 2 — both
+  codecs claim the tag, and their probes pick the right one per file).
 
 Zero C dependencies. Zero FFI.
 
@@ -143,51 +145,77 @@ bitrate, pixel format, etc.).
 
 ## Extending the registry
 
-Codec crates expose a single `register(reg)` function that pushes their
-implementation(s) into the registry. The registry supports multiple
-implementations per codec id with priority + capability fallback, so
-you can register a fast-but-lossy impl and a slow-but-accurate one and
-have the registry pick based on `CodecPreferences`:
+Codec crates expose a single `register(reg)` function that hands one
+`CodecInfo` per codec id to the registry. The struct is
+`#[non_exhaustive]` with a builder, so new optional fields can be added
+in future releases without breaking existing codec crates. The registry
+supports multiple implementations per codec id with priority +
+capability fallback, so you can register a fast-but-lossy impl and a
+slow-but-accurate one and let the registry pick based on
+`CodecPreferences`:
 
 ```rust
-pub fn register(reg: &mut oxideav_codec::CodecRegistry) {
-    let caps = CodecCapabilities::audio("my_codec_sw")
-        .with_lossless(true);
-    reg.register_both(
-        CodecId::new("my-codec"),
-        caps,
-        make_decoder,
-        make_encoder,
+use oxideav_codec::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecCapabilities, CodecId};
+
+pub fn register(reg: &mut CodecRegistry) {
+    reg.register(
+        CodecInfo::new(CodecId::new("my-codec"))
+            .capabilities(CodecCapabilities::audio("my_codec_sw").with_lossless(true))
+            .decoder(make_decoder)
+            .encoder(make_encoder),
     );
 }
 ```
 
 ## Claiming container tags
 
-A codec can attach container-level tags to its id so demuxers resolve
-them automatically. Tag kinds live in `oxideav_core::CodecTag` — AVI
-FourCC, WAVEFORMATEX `wFormatTag`, MP4 `ObjectTypeIndication`, and
-Matroska CodecID strings. Priority breaks ties; an optional probe
-disambiguates genuine collisions (the `DIV3`-tagged-as-MPEG-4-Part-2
-case that breaks naive FourCC tables):
+A codec attaches container-level tags to its registration via
+`.tag(...)` / `.tags([...])`. Tag kinds live in
+`oxideav_core::CodecTag` — AVI FourCC, WAVEFORMATEX `wFormatTag`, MP4
+`ObjectTypeIndication`, and Matroska CodecID strings. An optional
+`.probe(fn)` returns a `f32` confidence in `0.0..=1.0` so the registry
+can disambiguate genuine collisions (the famous
+`DIV3`-tagged-as-MPEG-4-Part-2 case). The highest-confidence claim
+wins; no probe means "confidence 1.0 for every claimed tag".
 
 ```rust
-use oxideav_core::{CodecId, CodecTag};
+use oxideav_codec::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecId, CodecTag, ProbeContext};
 
-let cid = CodecId::new("mpeg4video");
+fn probe_is_mpeg4_part2(ctx: &ProbeContext) -> f32 {
+    match ctx.packet {
+        Some(d) if d.windows(3).take(8).any(|w| w == [0, 0, 1]) => 1.0,
+        Some(_) => 0.0,
+        None => 0.5,
+    }
+}
 
-// Unambiguous claims: just a priority.
-reg.claim_tag(cid.clone(), CodecTag::fourcc(b"XVID"), 10, None);
-reg.claim_tag(cid.clone(), CodecTag::fourcc(b"DX50"), 10, None);
-
-// Ambiguous: DIV3 is usually msmpeg4v3 but sometimes real Part 2.
-// Claim it at a lower priority with a probe — the demuxer decides
-// per-packet by peeking at the bitstream.
-reg.claim_tag(cid, CodecTag::fourcc(b"DIV3"), 5, Some(probe_is_mpeg4_part2));
+pub fn register(reg: &mut CodecRegistry) {
+    let id = CodecId::new("mpeg4video");
+    // Unambiguous claims.
+    reg.register(
+        CodecInfo::new(id.clone())
+            .capabilities(/* ... */ CodecCapabilities::video("mpeg4_sw"))
+            .decoder(make_decoder)
+            .encoder(make_encoder)
+            .tags([CodecTag::fourcc(b"XVID"), CodecTag::fourcc(b"DX50")]),
+    );
+    // Ambiguous: DIV3 is usually msmpeg4v3 but sometimes real Part 2.
+    // Tag-only (no factories — already registered above) with a probe
+    // that inspects the bitstream.
+    reg.register(
+        CodecInfo::new(id)
+            .probe(probe_is_mpeg4_part2)
+            .tag(CodecTag::fourcc(b"DIV3")),
+    );
+}
 ```
 
-Demuxers resolve via `registry.resolve_tag(&tag, probe_data)` — which is
-what `oxideav-avi`, `oxideav-mp4`, and `oxideav-mkv` do internally.
+Demuxers resolve via `registry.resolve_tag(&ProbeContext)` — which is
+what `oxideav-avi`, `oxideav-mp4`, and `oxideav-mkv` do internally,
+filling in hints like `bits_per_sample`, `channels`, and `width` /
+`height` from the container metadata they've already parsed.
 
 ## License
 
