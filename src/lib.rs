@@ -8,8 +8,7 @@
 //! `use oxideav_codec::Decoder;` continues to compile unchanged.
 
 pub use oxideav_core::{
-    CodecImplementation, CodecInfo, CodecRegistry, Decoder, DecoderFactory, Encoder,
-    EncoderFactory,
+    CodecImplementation, CodecInfo, CodecRegistry, Decoder, DecoderFactory, Encoder, EncoderFactory,
 };
 
 /// Compatibility module path for callers that imported through
